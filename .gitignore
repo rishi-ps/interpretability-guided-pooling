@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+*.egg
+.pytest_cache/
+.mypy_cache/
+
+# Experiment outputs (large files)
+experiments/results/scaled_eval/
+experiments/results/scaled_eval_partial_4ds/
+experiments/results/visualizations/
+experiments/results/*.png
+*.log
+
+# Keep CSV/JSON results (small, important)
+!experiments/results/*.csv
+!experiments/results/*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,15 @@
+Quick status check (ETA + progress bar):
+cat experiments/results/scaled_eval/status.txt
+
+Auto-refreshing status (updates every 5s):
+watch -n5 cat experiments/results/scaled_eval/status.txt
+
+Full live log (every individual result):
+tail -f experiments/results/scaled_eval/eval.log
+
+Attach to the tmux session to see raw output:
+tmux attach -t eval
+# Detach with Ctrl+B then D
+
+Kill the run if needed
+tmux send-keys -t eval C-c

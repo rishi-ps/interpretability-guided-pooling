@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "interpretability-guided-pooling"
+version = "0.1.0"
+description = "Interpretability-guided token pooling for visual document retrieval"
+requires-python = ">=3.10"
+dependencies = [
+    "colpali-engine>=0.3.13",
+    "torch>=2.0",
+    "scipy>=1.10",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+eval = [
+    "datasets>=2.14",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "tqdm>=4.65",
+    "einops>=0.7",
+]
+dev = [
+    "pytest>=7.0",
+    "interpretability-guided-pooling[eval]",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
