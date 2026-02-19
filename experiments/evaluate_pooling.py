@@ -41,12 +41,13 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Type, cast
 
 import numpy as np
 import pandas as pd
@@ -66,8 +67,10 @@ from src.importance_estimation import (
 )
 from src.importance_guided_pooling import (
     AdaptivePoolFactorTokenPooler,
+    ImportanceWeightedDistancePooler,
     ImportanceWeightedHierarchicalTokenPooler,
     ProtectAndPoolTokenPooler,
+    SplitAndAllocateTokenPooler,
     TopKTokenPooler,
 )
 
@@ -157,12 +160,14 @@ class ProgressTracker:
             f.write(line + "\n")
 
     def get_eta(self) -> str:
-        if self.completed_configs == 0:
+        if self.completed_configs == 0 or len(self.config_times) == 0:
             return "estimating..."
         avg_time = np.mean(self.config_times)
+        if np.isnan(avg_time) or np.isinf(avg_time):
+            return "estimating..."
         remaining = self.total_configs - self.completed_configs
         eta_seconds = avg_time * remaining
-        finish_time = datetime.now() + timedelta(seconds=eta_seconds)
+        finish_time = datetime.now() + timedelta(seconds=int(eta_seconds))
         return f"{self._fmt_duration(eta_seconds)} (finish ~{finish_time.strftime('%H:%M')})"
 
     def _write_status(self):
@@ -446,6 +451,84 @@ def embed_queries(
 
 
 # All 10 ViDoRe v1 benchmark datasets (from ColPali paper, Table 1)
+# ---------------------------------------------------------------------------
+# GPU thermal management
+# ---------------------------------------------------------------------------
+
+def get_gpu_temp() -> Optional[int]:
+    """Get current GPU temperature via nvidia-smi. Returns None if unavailable."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return int(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def thermal_cooldown(threshold: int = 72, target: int = 60, mandatory_pause: int = 15, tracker=None):
+    """If GPU temp exceeds threshold, sleep until it drops to target. Always pause mandatory_pause seconds."""
+    if mandatory_pause > 0:
+        time.sleep(mandatory_pause)
+    temp = get_gpu_temp()
+    if temp is None or temp < threshold:
+        return
+    msg = f"GPU temp {temp}°C exceeds {threshold}°C, cooling down to {target}°C..."
+    if tracker:
+        tracker.log(msg)
+    else:
+        print(msg)
+    while True:
+        time.sleep(15)
+        temp = get_gpu_temp()
+        if temp is None or temp <= target:
+            cool_msg = f"GPU cooled to {temp}°C, resuming."
+            if tracker:
+                tracker.log(cool_msg)
+            else:
+                print(cool_msg)
+            break
+
+
+# ---------------------------------------------------------------------------
+# Resume support
+# ---------------------------------------------------------------------------
+
+def load_completed_configs(output_path: Path, model_short: str) -> Set[Tuple[str, str, str, int]]:
+    """Load already-completed (dataset, method, importance_method, pool_factor) tuples from CSV."""
+    csv_path = output_path / f"results_{model_short}_all.csv"
+    completed = set()
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path)
+            for _, row in df.iterrows():
+                imp = str(row["importance_method"])
+                if imp == "nan" or imp == "":
+                    imp = "n/a"
+                completed.add((
+                    str(row["dataset"]),
+                    str(row["method"]),
+                    imp,
+                    int(row["pool_factor"]),
+                ))
+        except Exception:
+            pass
+    return completed
+
+
+def load_existing_results(output_path: Path, model_short: str) -> List[Dict[str, Any]]:
+    """Load existing result rows from CSV for resume."""
+    csv_path = output_path / f"results_{model_short}_all.csv"
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path)
+            return df.to_dict("records")
+        except Exception:
+            pass
+    return []
+
+
 VIDORE_V1_DATASETS = [
     # Academic Tasks
     "vidore/docvqa_test_subsampled",           # 500q / 500d, EN
@@ -563,7 +646,7 @@ def apply_pooling(
     Args:
         doc_embeddings: List of (tokens, dim) tensors.
         method: One of "none", "random", "hierarchical", "topk", "weighted_hierarchical",
-                "protect_and_pool", "adaptive".
+                "protect_and_pool", "adaptive", "split_allocate", "importance_weighted_distance".
         pool_factor: Compression factor.
         importance_scores: Required for importance-guided methods.
         random_seed: Seed for random method (for reproducibility / variance estimation).
@@ -616,6 +699,14 @@ def apply_pooling(
         )
         return pooler_adaptive.pool_embeddings(doc_embeddings)  # type: ignore
 
+    if method == "split_allocate":
+        pooler_sa = SplitAndAllocateTokenPooler(importance_scores=importance_scores)
+        return pooler_sa.pool_embeddings(doc_embeddings, pool_factor=pool_factor)  # type: ignore
+
+    if method == "importance_weighted_distance":
+        pooler_iwd = ImportanceWeightedDistancePooler(importance_scores=importance_scores)
+        return pooler_iwd.pool_embeddings(doc_embeddings, pool_factor=pool_factor)  # type: ignore
+
     raise ValueError(f"Unknown pooling method: {method}")
 
 
@@ -636,6 +727,9 @@ def evaluate_single_dataset(
     device: torch.device = torch.device("cpu"),
     tracker: Optional[ProgressTracker] = None,
     early_stop_threshold: float = 0.3,
+    allowed_methods: Optional[Set[str]] = None,
+    completed_configs: Optional[Set[Tuple[str, str, str, int]]] = None,
+    gpu_temp_threshold: int = 78,
 ) -> List[Dict[str, Any]]:
     """
     Run full evaluation on a single dataset.
@@ -680,6 +774,18 @@ def evaluate_single_dataset(
 
     # Define experiment configurations
     importance_methods = list(importance_cache.keys())
+
+    # All importance-guided method names
+    ALL_IMPORTANCE_METHODS = [
+        "topk", "weighted_hierarchical", "protect_and_pool",
+        "adaptive", "split_allocate", "importance_weighted_distance",
+    ]
+    # Filter by allowed methods if specified
+    active_importance_methods = [
+        m for m in ALL_IMPORTANCE_METHODS
+        if allowed_methods is None or m in allowed_methods
+    ]
+
     methods = [
         ("none", None),
         ("random", None),
@@ -687,10 +793,7 @@ def evaluate_single_dataset(
     ]
     for imp_method in importance_methods:
         methods.extend([
-            ("topk", imp_method),
-            ("weighted_hierarchical", imp_method),
-            ("protect_and_pool", imp_method),
-            ("adaptive", imp_method),
+            (m, imp_method) for m in active_importance_methods
         ])
 
     # Determine random seeds
@@ -725,6 +828,17 @@ def evaluate_single_dataset(
                 continue
             if method_name != "none" and pool_factor == 1:
                 continue
+
+            # Skip already-completed configs (resume support)
+            config_key = (dataset_short, method_name, importance_method or "n/a", pool_factor)
+            if completed_configs and config_key in completed_configs:
+                if tracker:
+                    tracker.log(f"    [SKIP] {method_name}{'_' + importance_method if importance_method else ''} PF={pool_factor} (already done)")
+                    tracker.completed_configs += 1
+                continue
+
+            # Thermal cooldown before each config (mandatory 15s pause + temp check)
+            thermal_cooldown(threshold=gpu_temp_threshold, tracker=tracker)
 
             # Track progress
             if tracker:
@@ -851,6 +965,9 @@ def run_evaluation(
     max_docs: Optional[int] = None,
     device: str = "cuda",
     early_stop_threshold: float = 0.3,
+    allowed_methods: Optional[Set[str]] = None,
+    resume: bool = False,
+    gpu_temp_threshold: int = 78,
 ):
     """Main evaluation loop across all datasets."""
     output_path = Path(output_dir)
@@ -878,14 +995,27 @@ def run_evaluation(
     # Derive a short model identifier for filenames
     model_short = model_name.split("/")[-1].lower().replace("-", "_")
 
+    # Resume support: load already-completed configs
+    completed_configs: Set[Tuple[str, str, str, int]] = set()
+    if resume:
+        completed_configs = load_completed_configs(output_path, model_short)
+        all_results = load_existing_results(output_path, model_short)
+        if completed_configs:
+            print(f"[RESUME] Found {len(completed_configs)} completed configs, skipping them.")
+    else:
+        all_results = []
+
+    if allowed_methods:
+        print(f"[METHODS] Running only: {sorted(allowed_methods)}")
+
     # Estimate total configs across all datasets for progress tracking
     # (approximate — actual count depends on method/PF filtering)
     n_importance = 2 + (1 if include_probe else 0)  # self_sim + centroid + maybe probe
-    n_methods_per_pf = 3 + (4 * n_importance)  # none/random/hier + 4 strategies * n_importance
+    n_methods_per_pf = 3 + (6 * n_importance)  # none/random/hier + 6 strategies * n_importance
     n_random_seeds = len(random_seeds) if random_seeds else 1
     # PF=1 only has "none"; other PFs have all methods except "none"
     configs_pf1 = 1  # just "none"
-    configs_per_other_pf = (n_random_seeds) + 1 + (4 * n_importance)  # random(seeds) + hier + importance methods
+    configs_per_other_pf = (n_random_seeds) + 1 + (6 * n_importance)  # random(seeds) + hier + importance methods
     other_pfs = [pf for pf in pool_factors if pf > 1]
     total_configs_per_ds = configs_pf1 + len(other_pfs) * configs_per_other_pf
     total_configs = total_configs_per_ds * len(dataset_names)
@@ -906,7 +1036,8 @@ def run_evaluation(
     tracker.log(f"Monitor progress: watch -n5 cat {status_file}")
     tracker.log(f"Full log: tail -f {log_file}")
 
-    all_results: List[Dict[str, Any]] = []
+    if not resume:
+        all_results = []
 
     for ds_idx, ds_name in enumerate(dataset_names):
         tracker.log(f"\n{'~'*60}")
@@ -926,6 +1057,9 @@ def run_evaluation(
                 device=dev,
                 tracker=tracker,
                 early_stop_threshold=early_stop_threshold,
+                allowed_methods=allowed_methods,
+                completed_configs=completed_configs,
+                gpu_temp_threshold=gpu_temp_threshold,
             )
         except EarlyStopError as e:
             tracker.log(f"EARLY STOP on {ds_name}: {e}")
@@ -1252,6 +1386,19 @@ Examples:
         help="Abort if baseline NDCG@5 < 0.05. Warn if a method drops below "
              "this fraction of baseline at PF<=4 (default: 0.3 = 30%%).",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from previous run: skip already-completed configs found in output CSV.",
+    )
+    parser.add_argument(
+        "--methods", type=str, nargs="*", default=None,
+        help="Only run these importance-guided methods (e.g., --methods split_allocate importance_weighted_distance weighted_hierarchical). "
+             "Baselines (none, random, hierarchical) always run.",
+    )
+    parser.add_argument(
+        "--gpu-temp-threshold", type=int, default=78,
+        help="Pause evaluation if GPU temp exceeds this (default: 78°C). Set 0 to disable.",
+    )
     args = parser.parse_args()
 
     run_evaluation(
@@ -1265,6 +1412,9 @@ Examples:
         max_docs=args.max_docs,
         device=args.device,
         early_stop_threshold=args.early_stop_threshold,
+        allowed_methods=set(args.methods) if args.methods else None,
+        resume=args.resume,
+        gpu_temp_threshold=args.gpu_temp_threshold if args.gpu_temp_threshold > 0 else 999,
     )
 
 

@@ -1,0 +1,7 @@
+dataset,method,importance_method,pool_factor,ndcg@5,recall@5,avg_tokens,compression_ratio,pool_time_s,score_time_s,seed,model
+docvqa_test_subsampled,importance_weighted_distance,self_similarity,2,0.5077100143432617,0.584,534.38,0.5004309692039317,25.20944094657898,22.43794012069702,,colmodernvbert
+docvqa_test_subsampled,importance_weighted_distance,centroid_distance,2,0.5117940468788147,0.59,534.38,0.5004309692039317,27.223334074020386,27.34772276878357,,colmodernvbert
+docvqa_test_subsampled,importance_weighted_distance,self_similarity,4,0.5073095079660416,0.588,267.18,0.7502248331747192,25.935524463653564,24.345701217651367,,colmodernvbert
+docvqa_test_subsampled,importance_weighted_distance,centroid_distance,4,0.5115702843666077,0.59,267.18,0.7502248331747192,28.562239170074463,36.525044441223145,,colmodernvbert
+docvqa_test_subsampled,importance_weighted_distance,self_similarity,8,0.4892632068395615,0.572,133.1,0.8755704966522762,30.91711711883545,33.93978309631348,,colmodernvbert
+docvqa_test_subsampled,importance_weighted_distance,centroid_distance,8,0.49557136750221253,0.578,133.1,0.8755704966522762,37.55881690979004,42.55955672264099,,colmodernvbert

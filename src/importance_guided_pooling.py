@@ -5,7 +5,7 @@ These pooling strategies use per-token importance scores to make informed decisi
 about which tokens to keep, merge, or discard during compression. They extend
 the BaseTokenPooler interface from the ColPali engine.
 
-Four strategies are provided:
+Six strategies are provided:
 1. **TopKTokenPooler**: Keep the k most important tokens.
 2. **ImportanceWeightedHierarchicalTokenPooler**: Hierarchical clustering with
    importance-weighted mean pooling within clusters.
@@ -13,6 +13,10 @@ Four strategies are provided:
    pooling to the rest.
 4. **AdaptivePoolFactorTokenPooler**: Vary compression per document based on
    importance distribution entropy.
+5. **SplitAndAllocateTokenPooler**: Split tokens into importance tiers and
+   allocate more cluster budget to the important tier.
+6. **ImportanceWeightedDistancePooler**: Scale embeddings by importance before
+   computing distances for clustering, so important tokens resist merging.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -284,9 +288,12 @@ class ProtectAndPoolTokenPooler(BaseTokenPooler):
         token_length = embedding.size(0)
         target_output = max(token_length // pool_factor, 1)
 
-        # Determine how many tokens to protect
+        # Determine how many tokens to protect.
+        # Reserve at least 25% of the output budget for pooling the remaining tokens,
+        # to avoid collapsing to pure top-k selection at high pool factors.
+        max_protect = max(int(target_output * 0.75), 1)
         n_protect = max(int(token_length * protect_fraction), 1)
-        n_protect = min(n_protect, target_output)  # Can't protect more than target output
+        n_protect = min(n_protect, max_protect)
 
         # Get protected indices (sorted to preserve order)
         _, topk_indices = scores.to(embedding.device).topk(n_protect, dim=0)
@@ -408,12 +415,13 @@ class AdaptivePoolFactorTokenPooler(BaseTokenPooler):
     def _compute_effective_pool_factor(self, scores: torch.Tensor) -> int:
         """Compute effective pool factor from importance score entropy."""
         scores_f = scores.float()
-        # Normalize scores to a probability distribution (they are already in [0,1])
-        # Add small epsilon to avoid zeros, then normalize to sum to 1
-        probs = scores_f + 1e-10
-        probs = probs / probs.sum()
+        # Use softmax with temperature to create a sharper probability distribution.
+        # Raw min-max normalized scores are nearly uniform for large token counts,
+        # which makes entropy uninformative. Temperature < 1 amplifies differences.
+        temperature = 0.1
+        probs = torch.softmax(scores_f / temperature, dim=0)
         # Shannon entropy
-        entropy = -(probs * torch.log(probs)).sum()
+        entropy = -(probs * torch.log(probs + 1e-10)).sum()
         max_entropy = np.log(scores.numel())
         normalized_entropy = (entropy.item() / max_entropy) if max_entropy > 0 else 1.0
         normalized_entropy = min(max(normalized_entropy, 0.0), 1.0)
@@ -467,6 +475,290 @@ class AdaptivePoolFactorTokenPooler(BaseTokenPooler):
         max_clusters = max(token_length // pool_factor, 1)
         cluster_labels: NDArray[np.int32] = fcluster(Z, t=max_clusters, criterion="maxclust") - 1
 
+        cluster_map: Dict[int, Tuple[torch.Tensor]] = {}
+        pooled_list: List[torch.Tensor] = []
+
+        with torch.no_grad():
+            for c_id in range(max_clusters):
+                c_indices = cast(
+                    Tuple[torch.Tensor],
+                    torch.where(torch.tensor(cluster_labels == c_id)),
+                )
+                cluster_map[c_id] = c_indices
+                if c_indices[0].numel() > 0:
+                    pooled = embedding_f[c_indices].mean(dim=0)
+                    pooled = F.normalize(pooled, p=2, dim=-1)
+                    pooled_list.append(pooled)
+
+        pooled_embeddings = torch.stack(pooled_list, dim=0).to(device).to(dtype)
+        return pooled_embeddings, cluster_map
+
+
+class SplitAndAllocateTokenPooler(BaseTokenPooler):
+    """
+    Importance-guided cluster budget allocation.
+
+    Splits tokens into two tiers by importance, then allocates more of the fixed
+    cluster budget to the important tier. Both tiers are compressed via
+    hierarchical clustering independently, then concatenated.
+
+    For a pool_factor of 4 with 1000 tokens (250 output clusters):
+      - Top 50% (500 tokens) → 188 clusters (75% of budget, effective PF ≈ 2.7)
+      - Bottom 50% (500 tokens) → 62 clusters (25% of budget, effective PF ≈ 8.1)
+      - Total: 250 clusters (same as standard hierarchical)
+
+    This gives important tokens (text, tables, figures) 3× the representation
+    fidelity of unimportant tokens (margins, backgrounds), at the same total
+    storage cost as standard hierarchical pooling.
+
+    Args:
+        importance_scores: Precomputed importance scores.
+        split_fraction: Fraction of tokens in the "important" tier (default: 0.5).
+        budget_fraction: Fraction of cluster budget allocated to the important tier (default: 0.75).
+    """
+
+    def __init__(
+        self,
+        importance_scores: Union[List[torch.Tensor], None] = None,
+        split_fraction: float = 0.5,
+        budget_fraction: float = 0.75,
+    ):
+        if not 0.0 < split_fraction < 1.0:
+            raise ValueError(f"split_fraction must be in (0, 1), got {split_fraction}")
+        if not 0.0 < budget_fraction < 1.0:
+            raise ValueError(f"budget_fraction must be in (0, 1), got {budget_fraction}")
+        self.importance_scores = importance_scores
+        self.split_fraction = split_fraction
+        self.budget_fraction = budget_fraction
+
+    def _pool_embeddings_impl(
+        self,
+        embeddings: List[torch.Tensor],
+        pool_factor: int = 2,
+        importance_scores: Optional[List[torch.Tensor]] = None,
+        num_workers: Optional[int] = None,
+    ) -> Tuple[List[torch.Tensor], List[Dict[int, Tuple[torch.Tensor]]]]:
+        scores = importance_scores or self.importance_scores
+        if scores is None:
+            raise ValueError("importance_scores must be provided either at init or at call time.")
+
+        args = list(
+            zip(
+                embeddings,
+                scores,
+                [pool_factor] * len(embeddings),
+                [self.split_fraction] * len(embeddings),
+                [self.budget_fraction] * len(embeddings),
+            )
+        )
+
+        if num_workers and num_workers > 1:
+            with ThreadPoolExecutor(num_workers) as executor:
+                results = list(executor.map(lambda a: self._pool_single(*a), args))
+        else:
+            results = [self._pool_single(*a) for a in args]
+
+        pooled = [r[0] for r in results]
+        mappings = [r[1] for r in results]
+        return pooled, mappings
+
+    @staticmethod
+    def _pool_single(
+        embedding: torch.Tensor,
+        scores: torch.Tensor,
+        pool_factor: int,
+        split_fraction: float,
+        budget_fraction: float,
+    ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor]]]:
+        token_length = embedding.size(0)
+        if token_length <= 1:
+            raise ValueError("Input must have more than one token.")
+
+        if pool_factor == 1:
+            cluster_map = {0: (torch.arange(token_length),)}
+            return embedding, cluster_map
+
+        total_clusters = max(token_length // pool_factor, 1)
+
+        # Split tokens into important / unimportant tiers
+        n_important = max(int(token_length * split_fraction), 1)
+        n_important = min(n_important, token_length - 1)  # Ensure at least 1 unimportant
+
+        _, sorted_indices = scores.to(embedding.device).sort(descending=True)
+        important_indices = sorted_indices[:n_important].sort().values
+        unimportant_indices = sorted_indices[n_important:].sort().values
+
+        # Allocate cluster budget
+        clusters_important = max(int(total_clusters * budget_fraction), 1)
+        clusters_unimportant = max(total_clusters - clusters_important, 1)
+        # Adjust if a tier has fewer tokens than clusters
+        clusters_important = min(clusters_important, n_important)
+        clusters_unimportant = min(clusters_unimportant, token_length - n_important)
+        # Reallocate any surplus
+        surplus = total_clusters - clusters_important - clusters_unimportant
+        if surplus > 0:
+            if clusters_important < n_important:
+                add = min(surplus, n_important - clusters_important)
+                clusters_important += add
+                surplus -= add
+            if surplus > 0 and clusters_unimportant < (token_length - n_important):
+                clusters_unimportant += surplus
+
+        dtype = embedding.dtype
+        device = embedding.device
+        embedding_f = embedding.to(torch.float32).cpu()
+
+        cluster_map: Dict[int, Tuple[torch.Tensor]] = {}
+        pooled_list: List[torch.Tensor] = []
+        cluster_offset = 0
+
+        # Pool each tier independently
+        for tier_indices, n_clusters in [
+            (important_indices, clusters_important),
+            (unimportant_indices, clusters_unimportant),
+        ]:
+            tier_embs = embedding_f[tier_indices]  # (n_tier, dim)
+            n_tier = tier_embs.size(0)
+
+            if n_tier <= n_clusters:
+                # Fewer tokens than clusters — keep all tokens as-is
+                for i, idx in enumerate(tier_indices):
+                    cluster_map[cluster_offset + i] = (idx.unsqueeze(0),)
+                    pooled_list.append(F.normalize(tier_embs[i], p=2, dim=-1))
+                cluster_offset += n_tier
+            else:
+                # Hierarchical clustering within the tier
+                similarities = torch.mm(tier_embs, tier_embs.t())
+                distances = 1 - similarities.numpy()
+                Z = linkage(distances, metric="euclidean", method="ward")  # noqa: N806
+                cluster_labels: NDArray[np.int32] = fcluster(Z, t=n_clusters, criterion="maxclust") - 1
+
+                with torch.no_grad():
+                    for c_id in range(n_clusters):
+                        c_local = cast(
+                            Tuple[torch.Tensor],
+                            torch.where(torch.tensor(cluster_labels == c_id)),
+                        )
+                        # Map back to original document-level indices
+                        c_global = tier_indices[c_local[0]]
+                        cluster_map[cluster_offset + c_id] = (c_global,)
+
+                        if c_local[0].numel() > 0:
+                            pooled = tier_embs[c_local].mean(dim=0)
+                            pooled = F.normalize(pooled, p=2, dim=-1)
+                            pooled_list.append(pooled)
+
+                cluster_offset += n_clusters
+
+        pooled_embeddings = torch.stack(pooled_list, dim=0).to(device).to(dtype)
+        return pooled_embeddings, cluster_map
+
+
+class ImportanceWeightedDistancePooler(BaseTokenPooler):
+    """
+    Scale embeddings by importance before computing distances for clustering.
+
+    Important tokens are scaled up, making them appear "further" from other tokens
+    in the distance space used for hierarchical clustering. This causes Ward linkage
+    to preferentially merge unimportant tokens first, giving important tokens smaller
+    (more precise) clusters.
+
+    Critically, the cluster *representatives* are computed from the original
+    (unscaled) embeddings — the scaling only affects the merge order, not the
+    output vectors. This preserves the embedding space geometry for MaxSim scoring.
+
+    Scaling formula per token i:
+        e_i_scaled = e_i * (1 + alpha * importance_i_normalized)
+
+    where importance_i_normalized is min-max scaled to [0, 1] within the document.
+
+    Args:
+        importance_scores: Precomputed per-token importance scores.
+        alpha: Scaling strength (default: 1.0). Higher values make importance
+               have a stronger effect on cluster formation.
+    """
+
+    def __init__(
+        self,
+        importance_scores: Union[List[torch.Tensor], None] = None,
+        alpha: float = 1.0,
+    ):
+        if alpha < 0:
+            raise ValueError(f"alpha must be >= 0, got {alpha}")
+        self.importance_scores = importance_scores
+        self.alpha = alpha
+
+    def _pool_embeddings_impl(
+        self,
+        embeddings: List[torch.Tensor],
+        pool_factor: int = 2,
+        importance_scores: Optional[List[torch.Tensor]] = None,
+        num_workers: Optional[int] = None,
+    ) -> Tuple[List[torch.Tensor], List[Dict[int, Tuple[torch.Tensor]]]]:
+        scores = importance_scores or self.importance_scores
+        if scores is None:
+            raise ValueError("importance_scores must be provided either at init or at call time.")
+
+        args = list(
+            zip(
+                embeddings,
+                scores,
+                [pool_factor] * len(embeddings),
+                [self.alpha] * len(embeddings),
+            )
+        )
+
+        if num_workers and num_workers > 1:
+            with ThreadPoolExecutor(num_workers) as executor:
+                results = list(executor.map(lambda a: self._pool_single(*a), args))
+        else:
+            results = [self._pool_single(*a) for a in args]
+
+        pooled = [r[0] for r in results]
+        mappings = [r[1] for r in results]
+        return pooled, mappings
+
+    @staticmethod
+    def _pool_single(
+        embedding: torch.Tensor,
+        scores: torch.Tensor,
+        pool_factor: int,
+        alpha: float,
+    ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor]]]:
+        token_length = embedding.size(0)
+        if token_length <= 1:
+            raise ValueError("Input must have more than one token.")
+
+        if pool_factor == 1:
+            cluster_map = {0: (torch.arange(token_length),)}
+            return embedding, cluster_map
+
+        dtype = embedding.dtype
+        device = embedding.device
+        embedding_f = embedding.to(torch.float32).cpu()
+        scores_f = scores.to(torch.float32).cpu()
+
+        # Min-max normalize importance to [0, 1]
+        s_min = scores_f.min()
+        s_max = scores_f.max()
+        if s_max - s_min > 1e-10:
+            scores_norm = (scores_f - s_min) / (s_max - s_min)
+        else:
+            scores_norm = torch.ones_like(scores_f)
+
+        # Scale embeddings: important tokens get larger magnitude
+        # This makes them "further" from others in Euclidean space
+        scale = 1.0 + alpha * scores_norm  # (token_length,)
+        scaled_embs = embedding_f * scale.unsqueeze(-1)  # (token_length, dim)
+
+        # Cluster on SCALED embeddings using Euclidean distance
+        # Important tokens have larger magnitude → larger Euclidean distances
+        # → they resist merging and get their own smaller clusters
+        Z = linkage(scaled_embs.numpy(), metric="euclidean", method="ward")  # noqa: N806
+        max_clusters = max(token_length // pool_factor, 1)
+        cluster_labels: NDArray[np.int32] = fcluster(Z, t=max_clusters, criterion="maxclust") - 1
+
+        # Compute representatives from ORIGINAL embeddings (not scaled)
         cluster_map: Dict[int, Tuple[torch.Tensor]] = {}
         pooled_list: List[torch.Tensor] = []
 

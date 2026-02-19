@@ -16,8 +16,10 @@ from src.importance_estimation import (
 )
 from src.importance_guided_pooling import (
     AdaptivePoolFactorTokenPooler,
+    ImportanceWeightedDistancePooler,
     ImportanceWeightedHierarchicalTokenPooler,
     ProtectAndPoolTokenPooler,
+    SplitAndAllocateTokenPooler,
     TopKTokenPooler,
 )
 
@@ -31,7 +33,9 @@ __all__ = [
     "get_importance_map",
     # Pooling strategies
     "AdaptivePoolFactorTokenPooler",
+    "ImportanceWeightedDistancePooler",
     "ImportanceWeightedHierarchicalTokenPooler",
     "ProtectAndPoolTokenPooler",
+    "SplitAndAllocateTokenPooler",
     "TopKTokenPooler",
 ]
