@@ -33,11 +33,23 @@ $$\text{importance}(i) = 1 - \cos\left(e_i, \frac{1}{N}\sum_j e_j\right)$$
 
 $$\text{importance}(i) = \max_q \text{sim}(e_i, \text{probe}_q)$$
 
-The implementation is in `src/importance_estimation.py` with an abstract `BaseImportanceEstimator` class and concrete implementations for each strategy.
+**SVD Projection Energy (NEW — Feb 20):** Perform SVD on the (token_length × dim) embedding matrix. Tokens whose energy is concentrated along the top-k singular directions capture the most variance and are structurally important.
+
+$$\text{importance}(i) = \| U_{i,:k} \cdot S_{:k} \|_2$$
+
+where $U, S, V = \text{SVD}(E)$ and $k = \min(8, \min(n, d))$. Tokens with high projection onto the principal semantic directions are the primary carriers of the document's content.
+
+**Attention-Based Importance (NEW — Feb 20):** Hooks into the last attention layer of the text backbone and extracts the attention matrix. Per-token importance is the mean attention *received* by each token (column-mean of attention matrix):
+
+$$\text{importance}(i) = \frac{1}{H} \sum_h \frac{1}{N} \sum_j A_{h,j,i}$$
+
+Tokens that receive high attention from many others serve as "information hubs" in the transformer. Unlike the other estimators, this requires a forward pass through the model with document images — it cannot operate on pre-computed embeddings alone. The implementation supports real attention extraction via `estimate_from_images()` and a proxy mode for pre-computed attention scores.
+
+The implementation is in `src/importance_estimation.py` with an abstract `BaseImportanceEstimator` class and concrete implementations for all five strategies.
 
 ### 2.2 Importance-Guided Pooling Strategies
 
-Implemented six pooling strategies that use importance scores to make informed compression decisions. All extend the existing `BaseTokenPooler` interface from `colpali_engine`.
+Implemented seven pooling strategies that use importance scores to make informed compression decisions. All extend the existing `BaseTokenPooler` interface from `colpali_engine`.
 
 **Top-K Selection:** Keep the *k* most important tokens (where *k* = token_count / pool_factor), discarding the rest. Retained tokens are returned in their original order. This is the simplest strategy — it tests whether selection alone is sufficient.
 
@@ -51,7 +63,9 @@ Implemented six pooling strategies that use importance scores to make informed c
 
 **Importance-Weighted Distance (NEW — Feb 17):** A complementary approach to Split-and-Allocate. Instead of hard-splitting tokens into tiers, this method *softly* biases the clustering itself. Before computing distances for hierarchical clustering, embeddings are scaled by importance: $e_i' = e_i \cdot (1 + \alpha \cdot \hat{s}_i)$ where $\hat{s}_i$ is min-max normalized importance. Important tokens get larger magnitude → larger Euclidean distances → they resist merging and naturally end up in smaller, more precise clusters. Crucially, cluster representatives are computed from the *original* (unscaled) embeddings, preserving the embedding space geometry for MaxSim scoring. Default $\alpha = 1.0$. Same output token count as standard hierarchical — a fair comparison. This avoids Split-and-Allocate's hard tier boundary, which may hurt at low compression.
 
-All six strategies are in `src/importance_guided_pooling.py`, with unit tests (45 tests, 65 total with importance estimation tests) covering output shapes, normalisation, order preservation, budget compliance, alpha parameter behaviour, and edge cases.
+**Importance-Weighted K-Means (NEW — Feb 20):** K-means clustering with importance-biased initialization and weighted centroids. Instead of hierarchical Ward linkage, uses k-means which directly optimises reconstruction error. Key features: (1) importance-biased k-means++ initialization — important tokens are preferentially selected as seeds via D²-sampling weighted by importance, giving content-rich regions finer coverage from the start; (2) importance-weighted centroids — cluster representatives are biased toward important members via $w_i = 1 + \alpha \cdot \hat{s}_i$. Multiple restarts (default: 3) with best-by-inertia selection. Default $\alpha = 1.0$, max 20 iterations.
+
+All seven strategies are in `src/importance_guided_pooling.py`, with unit tests (62 pooling + 35 estimation = 97 total) covering output shapes, normalisation, order preservation, budget compliance, alpha parameter behaviour, k-means++ init properties, and edge cases.
 
 ### 2.3 Experiment Infrastructure
 
@@ -62,6 +76,8 @@ Built two experiment scripts:
   - Evaluates all 10 ViDoRe v1 benchmark datasets by default.
   - Correctly handles multi-query-per-document datasets (TabFQuAD, TAT-DQA) and practical task datasets with null-query distractor rows (syntheticDocQA_*, shiftproject).
   - Includes probe-based importance estimation via `--include-probe`.
+  - Includes attention-based importance estimation via `--include-attention` (requires forward pass per document).
+  - Supports all 5 estimators and 7 pooling methods via `--methods` flag.
   - Random baseline with multiple seeds (`--random-seeds 42 123 456`) for statistical robustness.
   - `ProgressTracker` class: writes live `status.txt` with progress bar + ETA, plus `eval.log` for full logging.
   - Early stopping: aborts if baseline NDCG@5 < 0.05; warns if a method drops below 30% of baseline at PF ≤ 4.
@@ -85,7 +101,7 @@ Rewrote `experiments/evaluate_pooling.py` to support the full ViDoRe v1 benchmar
 - **All 10 ViDoRe v1 datasets** are now the default (see §3.1 for the full list).
 - **Null-query filtering** — practical task datasets (Energy, Government, Healthcare, AI, Shift Project) store 1000 rows but only 100 have queries; the remaining 900 are document-only corpus pages. The loader now correctly filters null/empty queries and builds sparse relevance matrices (100 queries × ~1000 documents).
 - **Multi-query deduplication** — TabFQuAD (280 queries / 70 unique documents) and TAT-DQA (1663 queries / 277 unique documents) are deduplicated by `image_filename`, with proper relevance matrices.
-- **15+ methods evaluated per dataset** — 5 pooling strategies × 2–3 importance estimators + hierarchical baseline + random baseline + no-pooling baseline.
+- **15+ methods evaluated per dataset** — 7 pooling strategies × 2–5 importance estimators + hierarchical baseline + random baseline + no-pooling baseline.
 - **810 total configs** for the current run (10 datasets × 81 configs each).
 - **Probe-based importance** is now integrated into the evaluation loop.
 - **Random baseline** runs with 3 seeds (42, 123, 456), reporting mean ± std.
@@ -327,6 +343,115 @@ Round 2 evaluation **completed** across all 10 ViDoRe v1 datasets. 269 configs, 
 - IWD/centroid — the flagship method — is not the best on 4/10 datasets at PF=8. The story is "importance guidance helps" rather than "IWD/centroid is definitively superior."
 - At PF=2, importance-guided methods still tend to hurt slightly (not shown, but consistent with DocVQA findings in §3.6).
 
+### 3.8 Round 3 — New Estimators Pilot on DocVQA (Feb 20)
+
+Implemented two new importance estimators (SVD, Attention) and one new pooling method (Importance-Weighted K-Means). Ran a pilot on DocVQA (500 queries, 500 docs) at PF={4,8} with 3 estimators × 3 guided methods + baselines = 23 configs.
+
+**New method — IWK (Importance-Weighted K-Means):** Replaces hierarchical Ward linkage with k-means, using importance-biased D²-sampling for initialization and importance-weighted centroids. Hypothesis: direct reconstruction-error optimisation should outperform greedy agglomerative merging.
+
+**Round 3a — SVD estimator pilot (no attention yet):**
+
+| PF | Method | Estimator | NDCG@5 |
+|:--:|:-------|:----------|:------:|
+| 4 | hierarchical | — | 0.5091 |
+| 4 | IWD | centroid | **0.5116** |
+| 4 | IWD | svd | 0.5085 |
+| 4 | IWK | svd | 0.5033 |
+| 4 | IWK | centroid | 0.4992 |
+| 8 | hierarchical | — | 0.4758 |
+| 8 | IWK | centroid | **0.4986** |
+| 8 | IWD | centroid | 0.4956 |
+| 8 | IWK | svd | 0.4930 |
+| 8 | IWD | svd | 0.4884 |
+
+Key: **IWK/centroid beats IWD/centroid at PF=8** (0.4986 vs 0.4956, +0.003). SVD estimator is competitive but slightly below centroid_distance.
+
+**Round 3b — Attention estimator added:**
+
+| PF | Method | Estimator | NDCG@5 |
+|:--:|:-------|:----------|:------:|
+| 4 | IWD | **attention** | **0.5135** |
+| 4 | IWD | centroid | 0.5116 |
+| 4 | IWK | attention | 0.5054 |
+| 4 | WH | attention | 0.5085 |
+| 8 | IWD | **attention** | **0.4983** |
+| 8 | IWK | centroid | 0.4986 |
+| 8 | IWK | attention | 0.4954 |
+| 8 | IWD | centroid | 0.4956 |
+
+Key: **Attention is the best estimator for IWD** at both PF=4 (+0.0044 vs hier) and PF=8 (+0.0225 vs hier). However, for IWK, centroid still wins at PF=8.
+
+Results saved in `experiments/results/round3_pilot/` and `experiments/results/round3_attention_pilot/`.
+
+### 3.9 Round 4 — Extreme Compression + TopK Analysis on DocVQA (Feb 20)
+
+Extended evaluation to extreme pool factors (PF={16,32,64}) with all 5 estimators × core methods + TopK. ~350 configs on DocVQA. This round tests: (1) does importance guidance scale to extreme compression? (2) how does TopK (pure selection) compare to merge-based methods?
+
+**Summary by pool factor (DocVQA, best method at each PF):**
+
+| PF | Comp% | ~Tokens | Hier | Best Guided | Δ | Best Method/Estimator |
+|:--:|:-----:|:-------:|:----:|:-----------:|:---:|:---------------------|
+| 4 | 75% | 267 | 0.5091 | 0.5135 | +0.004 | IWD/attention |
+| 8 | 88% | 133 | 0.4758 | 0.4986 | +0.023 | IWK/centroid |
+| 16 | 94% | 67 | 0.4474 | 0.4629 | +0.016 | IWD/centroid |
+| 32 | 97% | 33 | 0.3925 | 0.4130 | +0.021 | IWD/attention |
+| 64 | 98% | 17 | 0.2901 | 0.3272 | +0.037 | IWK/attention |
+
+**The absolute gap grows with compression:** +0.004 at PF=4 → +0.037 at PF=64. At 98% compression (17 tokens per document), importance-guided methods recover 0.037 more NDCG than hierarchical.
+
+**TopK catastrophic failure at extreme compression:**
+
+| PF | TopK/attention | TopK/centroid | TopK/self_sim | TopK/svd | Random mean |
+|:--:|:--------------:|:-------------:|:-------------:|:--------:|:-----------:|
+| 4 | 0.4657 | 0.4074 | 0.4049 | **0.1801** | 0.4393 |
+| 8 | 0.4005 | 0.3001 | 0.3391 | **0.1282** | 0.3770 |
+| 16 | 0.3170 | 0.2004 | 0.2459 | **0.1093** | 0.3065 |
+| 32 | 0.1771 | 0.1519 | 0.2030 | **0.0914** | 0.2418 |
+| 64 | **0.0176** | 0.0909 | 0.1427 | 0.0765 | **0.1706** |
+
+**Critical finding — attention-guided TopK flips from best to worst:**
+- At PF=4–16: TopK/attention is the best TopK variant (0.4657, 0.4005, 0.3170).
+- At PF=64: TopK/attention collapses to **0.0176** — worse than random (0.1706), worse than every other TopK variant.
+- Root cause: attention scores follow a peaked distribution. At extreme compression, the top-17 tokens by attention are all near the same high-attention region, destroying spatial coverage. Other estimators maintain more spatial diversity.
+
+**SVD estimator is consistently poor for TopK** (0.1801 at PF=4 — far below random at 0.4393). SVD importance captures variance structure, not spatial diversity; pure selection based on SVD scores means selecting tokens from the dominant few singular directions, losing everything else.
+
+**Estimator convergence:** Among merge-based methods (IWD, IWK, WH), the gap between the best and worst estimator is ~0.006 NDCG (at PF=8). The gap between the best and worst *method* (IWK vs WH) is ~0.196 at PF=8. **Method matters ~30× more than estimator for merge-based approaches.**
+
+Results saved in `experiments/results/round4_quick/`.
+
+### 3.10 Critical Analysis and Honest Assessment (Feb 20)
+
+After four rounds of experiments, a blunt look at what the results actually mean.
+
+**Finding 1: The recovery ratio *decreases* with compression.**
+
+| PF | Hier drop from baseline | Best guided recovery | Recovery ratio |
+|:--:|:-----------------------:|:-------------------:|:--------------:|
+| 4 | −0.0071 | +0.0044 | 62% |
+| 8 | −0.0404 | +0.0228 | 56% |
+| 16 | −0.0688 | +0.0155 | 23% |
+| 32 | −0.1237 | +0.0205 | 17% |
+| 64 | −0.2261 | +0.0371 | 16% |
+
+The absolute NDCG gain grows (+0.004 → +0.037), but the quality lost by hierarchical grows much faster. Importance guidance recovers a *shrinking fraction* of the loss as compression increases.
+
+**Finding 2: At practical compression levels, gains are negligible.**
+
+- At PF=4 (75% compression, NDCG≈0.51): gain is +0.004 — unlikely to be statistically significant, certainly not meaningful in production.
+- At PF=8 (88%, NDCG≈0.50): gain is +0.023 — this is the sweet spot, arguably interesting.
+- At PF=64 (98%, NDCG≈0.33): gain is +0.037 — the biggest absolute gain, but 0.327 NDCG is too low for any practical use.
+
+**Finding 3: PF=2 beating baseline is noise.**
+
+Statistical analysis across 10 datasets showed that hierarchical at PF=2 beating the no-pooling baseline is not statistically significant: mean delta = −0.003, 4/10 datasets show positive deltas, all deltas within 0.15 standard errors. This is sampling noise, not a real effect.
+
+**Finding 4: No single method or estimator dominates.**
+
+At PF=8: IWK/centroid wins (0.4986). At PF=16: IWD/centroid wins (0.4629). At PF=64: IWK/attention wins (0.3272). The relative performance depends on the compression level, and the method/estimator differences are small compared to the method vs. baseline gap.
+
+**Implication for paper narrative:** The honest story is *not* "we found a breakthrough method that dramatically improves pooling." It is: "importance signals should guide cluster formation rather than within-cluster averaging; this yields consistent but modest improvements that grow with compression; the method choice matters more than the estimator choice; and pure selection (TopK) catastrophically fails, especially when guided by peaked attention distributions."
+
 ---
 
 ## 4. What To Do Next
@@ -386,20 +511,36 @@ Full 10-dataset evaluation with core methods and thermal protection.
 - Results save incrementally per dataset
 - **All 10 datasets complete.** Total time: ~5 hours. 269 data rows in combined CSV. See §3.7 for cross-dataset summary.
 
-### 4.10 Second Model (Feb 19–20)
+### 4.10 ~~New Estimators + IWK Method~~ ✅ DONE (Feb 20)
 
-Run on ColSmolVLM to demonstrate model-agnostic approach.
+Implemented SVD and Attention importance estimators, plus Importance-Weighted K-Means pooler. SVD uses top-k singular vector projection energy. Attention hooks into the last transformer layer and computes column-mean attention scores. IWK uses importance-biased k-means++ initialization with weighted centroids. 32 new tests added (97 total). Pilot results in §3.8.
 
-### 4.11 Publication-Quality Figures (Feb 20–22)
+### 4.11 ~~Round 3 + 4: Extreme Compression Testing~~ ✅ DONE (Feb 20)
+
+Extended evaluation to PF={16,32,64} on DocVQA with all 5 estimators and TopK method. ~350 configs total. Results in §3.9. Key findings: absolute gap grows to +0.037 at PF=64, TopK/attention collapses catastrophically, estimator choice matters ~30× less than method choice.
+
+### 4.12 Full 10-Dataset Run at High Pool Factors (Pending)
+
+Run all methods × 5 estimators × PF={4,8,16,32,64} across all 10 ViDoRe datasets. Estimated ~4.6 hours for ~558 new configs. This would validate whether the DocVQA Round 4 findings (growing gap, TopK failure, estimator convergence) generalise across datasets.
+
+### 4.13 Statistical Significance Testing (Pending)
+
+Run bootstrap confidence intervals or paired permutation tests on the key comparisons. Current results are single-seed without error bars. Need to determine whether the +0.023 at PF=8 and +0.037 at PF=64 are statistically significant across datasets.
+
+### 4.14 Second Model (Pending)
+
+Run on ColSmolVLM or another ColPali-family model to demonstrate model-agnostic approach.
+
+### 4.15 Publication-Quality Figures (Pending)
 
 - NDCG@5 vs. compression ratio curves.
 - Per-dataset bar charts.
 - Importance heatmap examples.
 - Method overview diagram: model output → importance estimation → cluster budget allocation → pooled embeddings.
 
-### 4.12 Paper Writing (Feb 22–27)
+### 4.16 Paper Writing (Feb 22–27)
 
-Structure in ICDAR format (~10 pages). Key narrative: initial importance-weighted pooling showed marginal gains → analysis revealed importance must guide cluster *formation* not *averaging* → two complementary approaches (Split-and-Allocate for hard budget allocation, Importance-Weighted Distance for soft clustering bias) → IWD emerges as primary method (+0.0198 NDCG@5 at 88% compression on DocVQA) → demonstrated on 10 datasets with 2 models.
+Structure in ICDAR format (~10 pages). Key narrative: importance signals should guide cluster *formation* (distance biasing, budget allocation, seed selection) rather than *within-cluster averaging* → three complementary approaches (IWD for soft distance-biasing, Split-and-Allocate for hard budget allocation, IWK for importance-biased k-means) → consistent gains at high compression across 10 datasets → TopK catastrophic failure reveals that merging is essential and selection alone destroys MaxSim coverage → estimator choice matters far less than method choice.
 
 ---
 
@@ -408,8 +549,8 @@ Structure in ICDAR format (~10 pages). Key narrative: initial importance-weighte
 ```
 src/
     __init__.py
-    importance_estimation.py              # 3 importance estimators + utility functions
-    importance_guided_pooling.py          # 6 pooling strategies (incl. Split-and-Allocate + Importance-Weighted Distance)
+    importance_estimation.py              # 5 importance estimators (self_sim, centroid, probe, svd, attention)
+    importance_guided_pooling.py          # 7 pooling strategies (incl. IWD, IWK, Split-and-Allocate)
 
 experiments/
     evaluate_pooling.py                   # Full evaluation pipeline (model-agnostic, 10 datasets)
@@ -418,22 +559,20 @@ experiments/
     results/
         pooling_evaluation_results.csv    # Pilot results (100-doc DocVQA, 56 configs)
         pooling_evaluation_results.json   # Same in JSON
-        round2/                           # Round 2: COMPLETED full eval with new methods
-            results_colmodernvbert_all.csv             # Combined results (269 rows, 10 datasets)
+        round2/                           # Round 2: Full eval, 10 datasets, PF={1,2,4,8}
+            results_colmodernvbert_all.csv             # Combined results (269 rows)
             results_colmodernvbert_<dataset>.csv       # Per-dataset results (10 files)
-            ndcg_combined_colmodernvbert.png            # Combined NDCG comparison plot
-            ndcg_vs_compression_colmodernvbert_*.png   # Per-dataset compression curves (10 files)
-            status.txt                                 # Final status: COMPLETED
-            eval.log                                   # Full evaluation log
-            full_output.log                            # tee'd stdout
+        round3_pilot/                     # Round 3a: SVD + IWK pilot on DocVQA (23 configs)
+        round3_attention_pilot/           # Round 3b: Attention estimator pilot on DocVQA (29 configs)
+        round4_quick/                     # Round 4: Extreme PF + TopK on DocVQA (~350 configs)
+            results_colmodernvbert_all.csv             # Master CSV with all results
 
 scripts/
     watch_eval.py                         # Monitor eval progress
-    stat_analysis.py                      # Statistical analysis of results
 
 tests/
-    test_importance_estimation.py         # 20 tests for importance estimators
-    test_importance_guided_pooling.py     # 45 tests for pooling strategies (65 total)
+    test_importance_estimation.py         # 35 tests for 5 importance estimators
+    test_importance_guided_pooling.py     # 62 tests for 7 pooling strategies (97 total)
 ```
 
 The codebase is a standalone package (installed via `pyproject.toml` in editable mode) that depends on `colpali_engine` from the sibling `../colpali/` directory.
