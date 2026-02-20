@@ -1,0 +1,8 @@
+=== Evaluation Status (16:14:52) ===
+Elapsed: 7.2m
+Progress: 71/710 configs (10.0%)
+Datasets: 1/10
+ETA: estimating...
+Currently:  / 
+
+[####------------------------------------] 10.0%

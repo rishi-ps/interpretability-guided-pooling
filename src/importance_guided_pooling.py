@@ -5,7 +5,7 @@ These pooling strategies use per-token importance scores to make informed decisi
 about which tokens to keep, merge, or discard during compression. They extend
 the BaseTokenPooler interface from the ColPali engine.
 
-Six strategies are provided:
+Seven strategies are provided:
 1. **TopKTokenPooler**: Keep the k most important tokens.
 2. **ImportanceWeightedHierarchicalTokenPooler**: Hierarchical clustering with
    importance-weighted mean pooling within clusters.
@@ -17,6 +17,8 @@ Six strategies are provided:
    allocate more cluster budget to the important tier.
 6. **ImportanceWeightedDistancePooler**: Scale embeddings by importance before
    computing distances for clustering, so important tokens resist merging.
+7. **ImportanceWeightedKMeansTokenPooler**: K-means clustering with importance-weighted
+   centroids and importance-biased initialization.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -771,6 +773,237 @@ class ImportanceWeightedDistancePooler(BaseTokenPooler):
                 cluster_map[c_id] = c_indices
                 if c_indices[0].numel() > 0:
                     pooled = embedding_f[c_indices].mean(dim=0)
+                    pooled = F.normalize(pooled, p=2, dim=-1)
+                    pooled_list.append(pooled)
+
+        pooled_embeddings = torch.stack(pooled_list, dim=0).to(device).to(dtype)
+        return pooled_embeddings, cluster_map
+
+
+class ImportanceWeightedKMeansTokenPooler(BaseTokenPooler):
+    """
+    K-means clustering with importance-weighted centroids and importance-biased
+    initialization (k-means++ with D² sampling weighted by importance).
+
+    Compared to hierarchical clustering (Ward linkage), k-means:
+    - Optimizes reconstruction error directly (important for MaxSim fidelity)
+    - Supports importance-weighted centroids: cluster representatives are biased
+      toward their most important members
+    - Uses importance-biased D²-sampling for initialization: important tokens
+      are preferentially chosen as initial seeds, giving content-rich regions
+      finer coverage from the start
+
+    The centroid for cluster c is:
+
+        centroid_c = normalize( sum_i w_i * e_i  for i in cluster_c )
+        where w_i = 1 + alpha * importance_i_normalized
+
+    Args:
+        importance_scores: Precomputed per-token importance scores.
+        alpha: Weight strength for centroids (default: 1.0). 0 = uniform k-means.
+        max_iters: Maximum k-means iterations (default: 20).
+        n_restarts: Number of random restarts, best by inertia (default: 3).
+    """
+
+    def __init__(
+        self,
+        importance_scores: Union[List[torch.Tensor], None] = None,
+        alpha: float = 1.0,
+        max_iters: int = 20,
+        n_restarts: int = 3,
+    ):
+        if alpha < 0:
+            raise ValueError(f"alpha must be >= 0, got {alpha}")
+        if max_iters < 1:
+            raise ValueError(f"max_iters must be >= 1, got {max_iters}")
+        if n_restarts < 1:
+            raise ValueError(f"n_restarts must be >= 1, got {n_restarts}")
+        self.importance_scores = importance_scores
+        self.alpha = alpha
+        self.max_iters = max_iters
+        self.n_restarts = n_restarts
+
+    def _pool_embeddings_impl(
+        self,
+        embeddings: List[torch.Tensor],
+        pool_factor: int = 2,
+        importance_scores: Optional[List[torch.Tensor]] = None,
+        num_workers: Optional[int] = None,
+    ) -> Tuple[List[torch.Tensor], List[Dict[int, Tuple[torch.Tensor]]]]:
+        scores = importance_scores or self.importance_scores
+        if scores is None:
+            raise ValueError("importance_scores must be provided either at init or at call time.")
+
+        args = list(
+            zip(
+                embeddings,
+                scores,
+                [pool_factor] * len(embeddings),
+                [self.alpha] * len(embeddings),
+                [self.max_iters] * len(embeddings),
+                [self.n_restarts] * len(embeddings),
+            )
+        )
+
+        if num_workers and num_workers > 1:
+            with ThreadPoolExecutor(num_workers) as executor:
+                results = list(executor.map(lambda a: self._pool_single(*a), args))
+        else:
+            results = [self._pool_single(*a) for a in args]
+
+        pooled = [r[0] for r in results]
+        mappings = [r[1] for r in results]
+        return pooled, mappings
+
+    @staticmethod
+    def _kmeans_plus_plus_init(
+        embeddings: torch.Tensor,
+        k: int,
+        importance_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Importance-biased K-means++ initialization.
+
+        Standard D² sampling is multiplied by importance weights, so important
+        tokens are more likely to be chosen as seeds. This gives content-rich
+        regions finer coverage from the start.
+
+        Args:
+            embeddings: (n, dim) float tensor, L2-normalized.
+            k: Number of clusters.
+            importance_weights: (n,) float tensor, positive.
+
+        Returns:
+            (k, dim) initial centroids.
+        """
+        n = embeddings.size(0)
+        chosen_indices: List[int] = []
+
+        # First centroid: sample proportional to importance
+        probs = importance_weights / importance_weights.sum()
+        idx = torch.multinomial(probs, 1).item()
+        chosen_indices.append(idx)
+
+        for _ in range(1, k):
+            # Distance to nearest existing centroid (cosine distance)
+            stacked = embeddings[chosen_indices]  # (current_k, dim)
+            sims = torch.mm(embeddings, stacked.t())  # (n, current_k)
+            min_dist = (1.0 - sims.max(dim=1).values).clamp(min=0)  # (n,)
+            # D² × importance weighting
+            weighted_dist = min_dist * min_dist * importance_weights
+            total = weighted_dist.sum()
+            if total < 1e-10:
+                # Fallback: pick random unchosen point
+                unchosen = list(set(range(n)) - set(chosen_indices))
+                idx = unchosen[torch.randint(len(unchosen), (1,)).item()] if unchosen else 0
+            else:
+                probs = weighted_dist / total
+                idx = torch.multinomial(probs, 1).item()
+            chosen_indices.append(idx)
+
+        return embeddings[chosen_indices].clone()
+
+    @staticmethod
+    def _pool_single(
+        embedding: torch.Tensor,
+        scores: torch.Tensor,
+        pool_factor: int,
+        alpha: float,
+        max_iters: int,
+        n_restarts: int,
+    ) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor]]]:
+        token_length = embedding.size(0)
+        if token_length <= 1:
+            raise ValueError("Input must have more than one token.")
+
+        if pool_factor == 1:
+            cluster_map = {0: (torch.arange(token_length),)}
+            return embedding, cluster_map
+
+        dtype = embedding.dtype
+        device = embedding.device
+        k = max(token_length // pool_factor, 1)
+
+        embedding_f = F.normalize(embedding.to(torch.float32).cpu(), p=2, dim=-1)
+        scores_f = scores.to(torch.float32).cpu()
+
+        # Min-max normalize importance to [0, 1]
+        s_min = scores_f.min()
+        s_max = scores_f.max()
+        if s_max - s_min > 1e-10:
+            scores_norm = (scores_f - s_min) / (s_max - s_min)
+        else:
+            scores_norm = torch.ones_like(scores_f)
+
+        # Importance-based weights for centroid computation
+        weights = 1.0 + alpha * scores_norm  # (token_length,)
+
+        best_centroids = None
+        best_labels = None
+        best_inertia = float("inf")
+
+        for restart in range(n_restarts):
+            torch.manual_seed(42 + restart)
+
+            # Importance-biased K-means++ init
+            centroids = ImportanceWeightedKMeansTokenPooler._kmeans_plus_plus_init(
+                embedding_f, k, weights,
+            )
+
+            labels = torch.zeros(token_length, dtype=torch.long)
+
+            for _ in range(max_iters):
+                # Assignment: each token → nearest centroid (cosine similarity)
+                sims = torch.mm(embedding_f, centroids.t())  # (n, k)
+                new_labels = sims.argmax(dim=1)  # (n,)
+
+                if torch.equal(new_labels, labels):
+                    break
+                labels = new_labels
+
+                # Update: importance-weighted centroid computation
+                new_centroids = torch.zeros_like(centroids)
+                for c_id in range(k):
+                    mask = labels == c_id
+                    if mask.sum() == 0:
+                        # Dead cluster: reinit to farthest point from all centroids
+                        sims_all = torch.mm(embedding_f, centroids.t())
+                        min_sim_per_point = sims_all.max(dim=1).values
+                        new_centroids[c_id] = embedding_f[min_sim_per_point.argmin()]
+                    else:
+                        cluster_embs = embedding_f[mask]
+                        cluster_weights = weights[mask]
+                        w_norm = cluster_weights / cluster_weights.sum()
+                        new_centroids[c_id] = (cluster_embs * w_norm.unsqueeze(-1)).sum(dim=0)
+
+                centroids = F.normalize(new_centroids, p=2, dim=-1)
+
+            # Inertia: importance-weighted sum of cosine distances
+            sims = torch.mm(embedding_f, centroids.t())
+            best_sim = sims.max(dim=1).values
+            inertia = (weights * (1.0 - best_sim)).sum().item()
+
+            if inertia < best_inertia:
+                best_inertia = inertia
+                best_centroids = centroids.clone()
+                best_labels = labels.clone()
+
+        # Build output from best run
+        cluster_map: Dict[int, Tuple[torch.Tensor]] = {}
+        pooled_list: List[torch.Tensor] = []
+
+        with torch.no_grad():
+            for c_id in range(k):
+                c_indices = cast(
+                    Tuple[torch.Tensor],
+                    torch.where(best_labels == c_id),
+                )
+                cluster_map[c_id] = c_indices
+                if c_indices[0].numel() > 0:
+                    cluster_embs = embedding_f[c_indices]
+                    cluster_weights = weights[c_indices[0]]
+                    w_norm = cluster_weights / cluster_weights.sum()
+                    pooled = (cluster_embs * w_norm.unsqueeze(-1)).sum(dim=0)
                     pooled = F.normalize(pooled, p=2, dim=-1)
                     pooled_list.append(pooled)
 

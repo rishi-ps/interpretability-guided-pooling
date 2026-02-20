@@ -11,6 +11,7 @@ from src.importance_guided_pooling import (
     AdaptivePoolFactorTokenPooler,
     ImportanceWeightedDistancePooler,
     ImportanceWeightedHierarchicalTokenPooler,
+    ImportanceWeightedKMeansTokenPooler,
     ProtectAndPoolTokenPooler,
     SplitAndAllocateTokenPooler,
     TopKTokenPooler,
@@ -496,3 +497,155 @@ class TestImportanceWeightedDistance:
                 diff_a5 = diff
 
         assert diff_a5 >= diff_a1, "Higher alpha should diverge more from hierarchical"
+
+
+# --- ImportanceWeightedKMeansTokenPooler ---
+
+
+class TestImportanceWeightedKMeans:
+    def test_output_shape(self, embeddings_and_scores):
+        embs, scores = embeddings_and_scores
+        pooler = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+        result = pooler.pool_embeddings(embs, pool_factor=4)
+        assert result[0].shape == (25, 128)
+
+    def test_same_token_count_as_hierarchical(self, embeddings_and_scores):
+        """Must produce the same number of output tokens as standard hierarchical."""
+        from colpali_engine.compression import HierarchicalTokenPooler
+
+        embs, scores = embeddings_and_scores
+        hier = HierarchicalTokenPooler()
+        kmeans = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+
+        for pf in [2, 4, 8]:
+            hier_result = hier.pool_embeddings(embs, pool_factor=pf)
+            kmeans_result = kmeans.pool_embeddings(embs, pool_factor=pf)
+            assert kmeans_result[0].shape[0] == hier_result[0].shape[0], (
+                f"PF={pf}: kmeans has {kmeans_result[0].shape[0]} tokens, "
+                f"hierarchical has {hier_result[0].shape[0]}"
+            )
+
+    def test_outputs_are_normalized(self, embeddings_and_scores):
+        embs, scores = embeddings_and_scores
+        pooler = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+        result = pooler.pool_embeddings(embs, pool_factor=4)
+        norms = result[0].float().norm(dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
+
+    def test_differs_from_hierarchical(self, embeddings_and_scores):
+        """K-means should produce different results from hierarchical clustering."""
+        from colpali_engine.compression import HierarchicalTokenPooler
+
+        embs, scores = embeddings_and_scores
+        hier = HierarchicalTokenPooler()
+        kmeans = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+
+        hier_result = hier.pool_embeddings(embs, pool_factor=4)
+        kmeans_result = kmeans.pool_embeddings(embs, pool_factor=4)
+
+        diff = (hier_result[0].float().sort(dim=0).values - kmeans_result[0].float().sort(dim=0).values).abs().sum()
+        assert diff > 0.01
+
+    def test_alpha_zero_is_uniform_kmeans(self, embeddings_and_scores):
+        """With alpha=0, weights are all 1.0 → uniform k-means."""
+        embs, scores = embeddings_and_scores
+        pooler = ImportanceWeightedKMeansTokenPooler(importance_scores=scores, alpha=0.0)
+        result = pooler.pool_embeddings(embs, pool_factor=4)
+        assert result[0].shape == (25, 128)
+        norms = result[0].float().norm(dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
+
+    def test_deterministic_across_runs(self, embeddings_and_scores):
+        """With fixed seed, two runs should produce identical results."""
+        embs, scores = embeddings_and_scores
+        pooler1 = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+        pooler2 = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+
+        result1 = pooler1.pool_embeddings(embs, pool_factor=4)
+        result2 = pooler2.pool_embeddings(embs, pool_factor=4)
+
+        diff = (result1[0].float() - result2[0].float()).abs().max()
+        assert diff < 1e-5, f"Two runs should match, max diff={diff}"
+
+    def test_batch_processing(self, batch_embeddings_and_scores):
+        embs, scores = batch_embeddings_and_scores
+        pooler = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+        result = pooler.pool_embeddings(embs, pool_factor=4)
+        assert result[0].shape[0] == 20  # 80 // 4
+        assert result[1].shape[0] == 30  # 120 // 4
+
+    def test_pool_factor_1(self, embeddings_and_scores):
+        embs, scores = embeddings_and_scores
+        pooler = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+        result = pooler.pool_embeddings(embs, pool_factor=1)
+        assert result[0].shape == embs[0].shape
+
+    def test_return_dict(self, embeddings_and_scores):
+        embs, scores = embeddings_and_scores
+        pooler = ImportanceWeightedKMeansTokenPooler(importance_scores=scores)
+        output = pooler.pool_embeddings(embs, pool_factor=4, return_dict=True)
+        assert output.cluster_id_to_indices is not None
+        assert len(output.cluster_id_to_indices) == 1
+
+    def test_invalid_alpha(self):
+        with pytest.raises(ValueError, match="alpha"):
+            ImportanceWeightedKMeansTokenPooler(alpha=-1.0)
+
+    def test_invalid_max_iters(self):
+        with pytest.raises(ValueError, match="max_iters"):
+            ImportanceWeightedKMeansTokenPooler(max_iters=0)
+
+    def test_invalid_n_restarts(self):
+        with pytest.raises(ValueError, match="n_restarts"):
+            ImportanceWeightedKMeansTokenPooler(n_restarts=0)
+
+    def test_raises_without_scores(self, embeddings_and_scores):
+        embs, _ = embeddings_and_scores
+        pooler = ImportanceWeightedKMeansTokenPooler()
+        with pytest.raises(ValueError, match="importance_scores"):
+            pooler.pool_embeddings(embs, pool_factor=2)
+
+    def test_scores_at_call_time(self, embeddings_and_scores):
+        embs, scores = embeddings_and_scores
+        pooler = ImportanceWeightedKMeansTokenPooler()
+        result = pooler.pool_embeddings(embs, pool_factor=4, importance_scores=scores)
+        assert result[0].shape == (25, 128)
+
+    def test_higher_alpha_stronger_effect(self, embeddings_and_scores):
+        """Higher alpha should produce results that differ more from uniform k-means."""
+        embs, scores = embeddings_and_scores
+        uniform = ImportanceWeightedKMeansTokenPooler(importance_scores=scores, alpha=0.0)
+        uniform_result = uniform.pool_embeddings(embs, pool_factor=4)
+
+        diff_a1 = 0.0
+        diff_a5 = 0.0
+        for alpha in [1.0, 5.0]:
+            weighted = ImportanceWeightedKMeansTokenPooler(importance_scores=scores, alpha=alpha)
+            weighted_result = weighted.pool_embeddings(embs, pool_factor=4)
+            diff = (uniform_result[0].float().sort(dim=0).values - weighted_result[0].float().sort(dim=0).values).abs().sum().item()
+            if alpha == 1.0:
+                diff_a1 = diff
+            else:
+                diff_a5 = diff
+
+        assert diff_a5 >= diff_a1, "Higher alpha should diverge more from uniform k-means"
+
+    def test_kmeans_plus_plus_init_shape(self):
+        """K-means++ init should return k centroids of correct shape."""
+        torch.manual_seed(42)
+        emb = torch.nn.functional.normalize(torch.randn(50, 128), p=2, dim=-1)
+        weights = torch.ones(50)
+        centroids = ImportanceWeightedKMeansTokenPooler._kmeans_plus_plus_init(emb, k=10, importance_weights=weights)
+        assert centroids.shape == (10, 128)
+
+    def test_kmeans_plus_plus_init_unique(self):
+        """K-means++ init should return distinct centroids."""
+        torch.manual_seed(42)
+        emb = torch.nn.functional.normalize(torch.randn(50, 128), p=2, dim=-1)
+        weights = torch.ones(50)
+        centroids = ImportanceWeightedKMeansTokenPooler._kmeans_plus_plus_init(emb, k=10, importance_weights=weights)
+        # All centroids should be different
+        for i in range(10):
+            for j in range(i + 1, 10):
+                diff = (centroids[i] - centroids[j]).abs().sum()
+                assert diff > 1e-6, f"Centroids {i} and {j} are identical"

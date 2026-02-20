@@ -1,6 +1,6 @@
 # Progress Update — Interpretability-Guided Token Pooling for Visual Document Retrieval
 
-**Date:** February 17, 2026 (updated)  
+**Date:** February 20, 2026 (updated)  
 **Target:** ICDAR 2026 (Deadline: February 27, 2026)
 
 ---
@@ -51,7 +51,7 @@ Implemented six pooling strategies that use importance scores to make informed c
 
 **Importance-Weighted Distance (NEW — Feb 17):** A complementary approach to Split-and-Allocate. Instead of hard-splitting tokens into tiers, this method *softly* biases the clustering itself. Before computing distances for hierarchical clustering, embeddings are scaled by importance: $e_i' = e_i \cdot (1 + \alpha \cdot \hat{s}_i)$ where $\hat{s}_i$ is min-max normalized importance. Important tokens get larger magnitude → larger Euclidean distances → they resist merging and naturally end up in smaller, more precise clusters. Crucially, cluster representatives are computed from the *original* (unscaled) embeddings, preserving the embedding space geometry for MaxSim scoring. Default $\alpha = 1.0$. Same output token count as standard hierarchical — a fair comparison. This avoids Split-and-Allocate's hard tier boundary, which may hurt at low compression.
 
-All six strategies are in `src/importance_guided_pooling.py`, with unit tests (45 tests) covering output shapes, normalisation, order preservation, budget compliance, alpha parameter behaviour, and edge cases.
+All six strategies are in `src/importance_guided_pooling.py`, with unit tests (45 tests, 65 total with importance estimation tests) covering output shapes, normalisation, order preservation, budget compliance, alpha parameter behaviour, and edge cases.
 
 ### 2.3 Experiment Infrastructure
 
@@ -94,9 +94,9 @@ Rewrote `experiments/evaluate_pooling.py` to support the full ViDoRe v1 benchmar
 
 ## 3. Experimental Results
 
-### 3.1 Full ViDoRe v1 Benchmark (In Progress)
+### 3.1 Full ViDoRe v1 Benchmark (Complete)
 
-Currently running the full evaluation on an RTX 3070 (8GB). Estimated ~53 hours total (revised from initial ~30h estimate due to larger-than-expected datasets like TAT-DQA with 1663 queries).
+Completed the full evaluation on an RTX 3070 (8GB). Round 2 finished in ~5 hours (430 configs across 10 datasets, 3 importance-guided strategies + baselines).
 
 **Model:** ColModernVBERT (240M parameters, ~480MB in fp16).
 
@@ -119,7 +119,9 @@ Currently running the full evaluation on an RTX 3070 (8GB). Estimated ~53 hours 
 **Compression ratios:** Pool factors 1, 2, 3, 4, 6, 8.  
 **Methods:** No pooling, random (3 seeds), hierarchical, + 4 importance-guided strategies × 3 estimators (self_similarity, centroid_distance, probe) = 15 methods.
 
-**Status:** Run terminated Feb 17 at 191/810 configs (23.6%). Datasets completed: DocVQA, InfoVQA. Partial: TAT-DQA (PF 2–3). Terminated to pivot to improved method (see §3.5). Results saved in `experiments/results/scaled_eval/`.
+**Status (Round 1):** Run terminated Feb 17 at 191/810 configs (23.6%). Datasets completed: DocVQA, InfoVQA. Partial: TAT-DQA (PF 2–3). Terminated to pivot to improved method (see §3.5). Results saved in `experiments/results/scaled_eval/`.
+
+**Status (Round 2):** ✅ **COMPLETED** Feb 17. All 10 datasets finished. 269 configs total, ~5 hours runtime. Results in `experiments/results/round2/`. See §3.7 for cross-dataset summary.
 
 ### 3.2 Full-Run Results — Round 1 (DocVQA & InfoVQA complete; TAT-DQA partial)
 
@@ -289,6 +291,42 @@ Baseline (no pooling): NDCG@5 = 0.5162, Recall@5 = 0.598, ~1070 tokens/doc.
 
 Results saved in `experiments/results/round2/`.
 
+### 3.7 Round 2 — Full 10-Dataset Cross-Dataset Results (Feb 17–20)
+
+Round 2 evaluation **completed** across all 10 ViDoRe v1 datasets. 269 configs, ~5h runtime. The results below show the best importance-guided method at each compression level vs. hierarchical baseline (fair comparison — same token count).
+
+**Best importance-guided method vs hierarchical, per dataset (NDCG@5 Δ, fair comparison):**
+
+| Dataset | PF=4 best | Δ@4 | PF=8 best | Δ@8 |
+|:--------|:----------|:---:|:----------|:---:|
+| ArXivQA | IWD/self_sim | +0.0076 | WH/centroid | +0.0007 |
+| DocVQA | IWD/centroid | +0.0025 | IWD/centroid | +0.0198 |
+| InfoVQA | IWD/centroid | +0.0050 | WH/centroid | +0.0039 |
+| ShiftProject | IWD/centroid | +0.0206 | IWD/self_sim | +0.0069 |
+| AI | IWD/self_sim | +0.0030 | IWD/centroid | +0.0243 |
+| Energy | SA/centroid | +0.0048 | IWD/self_sim | +0.0057 |
+| Government | WH/centroid | +0.0037 | SA/centroid | +0.0002 |
+| Healthcare | IWD/centroid | +0.0046 | WH/centroid | +0.0007 |
+| TabFQuAD | SA/centroid | +0.0137 | SA/centroid | +0.0244 |
+| TAT-DQA | WH/centroid | +0.0006 | IWD/centroid | +0.0080 |
+
+**IWD = importance_weighted_distance, SA = split_allocate, WH = weighted_hierarchical.**
+
+**Cross-dataset headline numbers:**
+
+- **At PF=8 (88% compression):** The best importance-guided method beats hierarchical on **all 10 datasets** (Δ range: +0.0002 to +0.0244). Average gain: +0.009 NDCG@5.
+- **At PF=4 (75% compression):** The best importance-guided method beats hierarchical on **all 10 datasets** (Δ range: +0.0006 to +0.0206). Average gain: +0.007 NDCG@5.
+- **IWD/centroid at PF=8 specifically:** Positive on 6/10 datasets, negative on 4/10 (mean Δ = +0.0052). Not a universal winner — wins are concentrated on DocVQA (+0.020), AI (+0.024), TabFQuAD (+0.019), TAT-DQA (+0.008). Losses are small (−0.002 to −0.016).
+- **No single method dominates PF=8 wins:** IWD/centroid wins 3, WH/centroid wins 3, IWD/self_sim wins 2, SA/centroid wins 2.
+- **The consistent finding is that *some* form of importance guidance always helps at high compression**, even though the optimal strategy varies by dataset.
+
+**Honest assessment:**
+
+- The gains are real and consistent in direction (always ≥ 0 for the best method), but small in magnitude (mean +0.009 NDCG@5 at PF=8). Whether this is "significant" in a practical sense depends on the application.
+- No statistical significance tests have been run (single seed, no bootstrap CIs). The per-dataset gains could partly be noise.
+- IWD/centroid — the flagship method — is not the best on 4/10 datasets at PF=8. The story is "importance guidance helps" rather than "IWD/centroid is definitively superior."
+- At PF=2, importance-guided methods still tend to hurt slightly (not shown, but consistent with DocVQA findings in §3.6).
+
 ---
 
 ## 4. What To Do Next
@@ -325,7 +363,7 @@ Changed entropy computation from raw min-max normalization to softmax with tempe
 
 Ran 37-config validation on DocVQA (PF 1/2/4/8, 2 estimators). Results in §3.6. **Split-and-Allocate + centroid achieves +0.0166 NDCG@5 over hierarchical at PF=8** — the largest fair-comparison gain seen so far.
 
-### 4.9 Full Round 2 Evaluation — ⏳ RUNNING (Feb 17)
+### 4.9 Full Round 2 Evaluation — ✅ COMPLETED (Feb 17)
 
 Full 10-dataset evaluation with core methods and thermal protection.
 
@@ -346,7 +384,7 @@ Full 10-dataset evaluation with core methods and thermal protection.
 - Running in **tmux** session `eval` (survives SSH disconnects)
 - Progress: `cat experiments/results/round2/status.txt`
 - Results save incrementally per dataset
-- **DocVQA complete** (25/430). **IWD/centroid is the new best method** — see §3.6.
+- **All 10 datasets complete.** Total time: ~5 hours. 269 data rows in combined CSV. See §3.7 for cross-dataset summary.
 
 ### 4.10 Second Model (Feb 19–20)
 
@@ -380,21 +418,22 @@ experiments/
     results/
         pooling_evaluation_results.csv    # Pilot results (100-doc DocVQA, 56 configs)
         pooling_evaluation_results.json   # Same in JSON
-        ndcg_vs_compression.png           # Pilot comparison plot
-        scaled_eval/                      # Round 1: full 10-dataset evaluation (terminated at 2/10)
-            status.txt                    # Live progress tracker
-            eval.log                      # Full evaluation log
-            full_output.log               # tee'd stdout
-        scaled_eval_partial_4ds/          # Partial results from earlier 4-dataset attempt
-        round2/                           # Round 2: validation + full eval with new methods
-            results_colmodernvbert_*.csv  # Per-dataset and combined results
-            status.txt                    # Live progress tracker
-            eval.log                      # Full evaluation log
-        visualizations/                   # Importance heatmaps for 5 documents
+        round2/                           # Round 2: COMPLETED full eval with new methods
+            results_colmodernvbert_all.csv             # Combined results (269 rows, 10 datasets)
+            results_colmodernvbert_<dataset>.csv       # Per-dataset results (10 files)
+            ndcg_combined_colmodernvbert.png            # Combined NDCG comparison plot
+            ndcg_vs_compression_colmodernvbert_*.png   # Per-dataset compression curves (10 files)
+            status.txt                                 # Final status: COMPLETED
+            eval.log                                   # Full evaluation log
+            full_output.log                            # tee'd stdout
+
+scripts/
+    watch_eval.py                         # Monitor eval progress
+    stat_analysis.py                      # Statistical analysis of results
 
 tests/
-    test_importance_estimation.py         # Tests for importance estimators
-    test_importance_guided_pooling.py     # Tests for pooling strategies
+    test_importance_estimation.py         # 20 tests for importance estimators
+    test_importance_guided_pooling.py     # 45 tests for pooling strategies (65 total)
 ```
 
 The codebase is a standalone package (installed via `pyproject.toml` in editable mode) that depends on `colpali_engine` from the sibling `../colpali/` directory.

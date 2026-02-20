@@ -9,6 +9,7 @@ Three strategies are provided:
 1. **Self-similarity redundancy**: Patches that are redundant (similar to many others) are less important.
 2. **Centroid distance**: Patches far from the mean embedding carry more distinctive information.
 3. **Probe-based importance**: Similarity to a set of semantic probe queries reveals content-bearing patches.
+4. **SVD projection**: Patches whose energy concentrates along the top singular vectors are structurally important.
 """
 
 from abc import ABC, abstractmethod
@@ -288,3 +289,190 @@ def get_importance_map(
             f"patch grid ({n_x} x {n_y} = {n_x * n_y})."
         )
     return importance_scores.view(n_y, n_x)
+
+
+class SVDImportanceEstimator(BaseImportanceEstimator):
+    """
+    Importance based on projection energy onto top singular vectors.
+
+    Perform SVD on the (token_length × dim) embedding matrix. Tokens whose energy
+    is concentrated along the top-k singular directions capture the most variance
+    in the embedding space and are therefore structurally important.
+
+    importance(i) = || U[:k, i] * S[:k] ||₂
+
+    where U, S, V = SVD(E) and k = rank (default: min(8, min(n, d))).
+
+    Intuition: The top singular vectors capture the principal semantic directions
+    of the document. Tokens with high projection onto these directions are the
+    primary carriers of the document's semantic content.
+
+    Args:
+        rank: Number of top singular components to use (default: 8).
+    """
+
+    def __init__(self, rank: int = 8):
+        if rank < 1:
+            raise ValueError(f"rank must be >= 1, got {rank}")
+        self.rank = rank
+
+    def estimate(
+        self,
+        embeddings: Union[torch.Tensor, List[torch.Tensor]],
+    ) -> ImportanceOutput:
+        embedding_list = self._prepare_embeddings(embeddings)
+        scores_list: List[torch.Tensor] = []
+
+        for emb in embedding_list:
+            # emb: (token_length, dim)
+            emb_float = emb.float()
+            k = min(self.rank, min(emb_float.shape))
+
+            # SVD: E = U @ diag(S) @ V^T
+            # U: (token_length, min(n,d)), S: (min(n,d),)
+            U, S, _ = torch.linalg.svd(emb_float, full_matrices=False)
+
+            # Per-token energy along top-k singular directions
+            # weighted_proj[i] = || U[i, :k] * S[:k] ||_2
+            weighted_proj = U[:, :k] * S[:k].unsqueeze(0)  # (token_length, k)
+            importance = weighted_proj.norm(dim=-1)  # (token_length,)
+
+            importance = self._normalize_scores(importance)
+            scores_list.append(importance.to(emb.dtype))
+
+        return ImportanceOutput(scores=scores_list, method="svd")
+
+
+class AttentionImportanceEstimator(BaseImportanceEstimator):
+    """
+    Importance based on attention weights from the model's text backbone.
+
+    Hooks into the last (or specified) attention layer of the text backbone and
+    extracts the attention matrix. Per-token importance is computed as the mean
+    attention received by each token across all heads and all other tokens.
+
+    importance(i) = mean_h mean_j A[h, j, i]   (column-mean of attention matrix)
+
+    Tokens that receive high attention from many other tokens are semantically
+    important — they serve as "information hubs" in the transformer.
+
+    This estimator requires a forward pass through the model with the document
+    images. Unlike the other estimators, it does NOT operate on pre-computed
+    embeddings — it needs the model and processor.
+
+    Args:
+        model: ColPali-family model.
+        processor: Corresponding processor.
+        layer_index: Which text backbone layer to hook (default: -1, last layer).
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        processor,
+        layer_index: int = -1,
+    ):
+        self.model = model
+        self.processor = processor
+        self.layer_index = layer_index
+        self._attention_weights: Optional[torch.Tensor] = None
+
+    def _get_attention_layer(self) -> torch.nn.Module:
+        """Locate the attention module in the text backbone."""
+        text_layers = self.model.model.text_model.layers
+        layer = text_layers[self.layer_index]
+        return layer.attn
+
+    def _hook_fn(self, module, input, output):
+        """Forward hook to capture attention weights."""
+        # ModernBERT's attention output structure may vary.
+        # We look for attention_weights in the output tuple.
+        if isinstance(output, tuple) and len(output) > 1:
+            # output[1] is typically attention weights: (batch, heads, seq, seq)
+            self._attention_weights = output[1]
+
+    def estimate_from_images(
+        self,
+        images: list,
+        doc_embeddings: Optional[List[torch.Tensor]] = None,
+        batch_size: int = 1,
+    ) -> ImportanceOutput:
+        """
+        Run forward passes on images and extract attention-based importance.
+
+        Processes images in batches to handle large datasets within GPU memory.
+        Uses output_attentions=True on the inner model and takes the column-mean
+        of the attention matrix from the specified layer.
+
+        Args:
+            images: List of PIL images.
+            doc_embeddings: Pre-computed document embeddings (used to align token
+                            counts — the zero-padding mask from embedding gives the
+                            number of real tokens per document).
+            batch_size: Number of images per forward pass (default: 1 for safety
+                        since attention matrices are large).
+
+        Returns:
+            ImportanceOutput with per-document importance scores.
+        """
+        device = next(self.model.parameters()).device
+        scores_list: List[torch.Tensor] = []
+
+        for i in range(0, len(images), batch_size):
+            batch_imgs = images[i : i + batch_size]
+            batch = self.processor.process_images(batch_imgs).to(device)
+
+            with torch.no_grad():
+                out = self.model.model(**batch, output_attentions=True)
+
+            # Get attention from specified layer: (B, heads, seq, seq)
+            attn = out.attentions[self.layer_index]
+
+            # Free all other attention layers immediately
+            del out
+
+            for j in range(attn.size(0)):
+                attn_j = attn[j].float()  # (heads, seq, seq)
+                # Column-mean: how much attention each token receives
+                received = attn_j.mean(dim=0).mean(dim=0)  # (seq,)
+
+                # Align with doc_embeddings: padding tokens are at the end,
+                # so take the first n_tokens matching the embedding length
+                if doc_embeddings is not None:
+                    n_tokens = doc_embeddings[i + j].size(0)
+                    received = received[:n_tokens]
+
+                importance = self._normalize_scores(received)
+                scores_list.append(importance.cpu())
+
+            del attn
+            torch.cuda.empty_cache()
+
+        return ImportanceOutput(scores=scores_list, method="attention")
+
+    def estimate(
+        self,
+        embeddings: Union[torch.Tensor, List[torch.Tensor]],
+    ) -> ImportanceOutput:
+        """
+        Fallback: estimate importance from embeddings using attention-like heuristic.
+
+        When called with pre-computed embeddings (no forward pass available),
+        uses a self-attention proxy: computes softmax(E @ E^T / sqrt(d)) and
+        takes column means as importance.
+        """
+        embedding_list = self._prepare_embeddings(embeddings)
+        scores_list: List[torch.Tensor] = []
+
+        for emb in embedding_list:
+            emb_float = F.normalize(emb.float(), p=2, dim=-1)
+            d = emb_float.size(-1)
+            # Scaled dot-product attention proxy
+            attn = torch.mm(emb_float, emb_float.t()) / (d ** 0.5)
+            attn = torch.softmax(attn, dim=-1)  # (n, n)
+            # Column mean: attention received
+            importance = attn.mean(dim=0)  # (n,)
+            importance = self._normalize_scores(importance)
+            scores_list.append(importance.to(emb.dtype))
+
+        return ImportanceOutput(scores=scores_list, method="attention_proxy")

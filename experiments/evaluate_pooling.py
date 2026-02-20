@@ -61,14 +61,17 @@ from colpali_engine.compression import HierarchicalTokenPooler
 
 # Our imports
 from src.importance_estimation import (
+    AttentionImportanceEstimator,
     CentroidDistanceImportanceEstimator,
     ProbeImportanceEstimator,
+    SVDImportanceEstimator,
     SelfSimilarityImportanceEstimator,
 )
 from src.importance_guided_pooling import (
     AdaptivePoolFactorTokenPooler,
     ImportanceWeightedDistancePooler,
     ImportanceWeightedHierarchicalTokenPooler,
+    ImportanceWeightedKMeansTokenPooler,
     ProtectAndPoolTokenPooler,
     SplitAndAllocateTokenPooler,
     TopKTokenPooler,
@@ -707,6 +710,10 @@ def apply_pooling(
         pooler_iwd = ImportanceWeightedDistancePooler(importance_scores=importance_scores)
         return pooler_iwd.pool_embeddings(doc_embeddings, pool_factor=pool_factor)  # type: ignore
 
+    if method == "importance_weighted_kmeans":
+        pooler_km = ImportanceWeightedKMeansTokenPooler(importance_scores=importance_scores)
+        return pooler_km.pool_embeddings(doc_embeddings, pool_factor=pool_factor)  # type: ignore
+
     raise ValueError(f"Unknown pooling method: {method}")
 
 
@@ -721,6 +728,7 @@ def evaluate_single_dataset(
     dataset_name: str,
     pool_factors: List[int],
     include_probe: bool = False,
+    include_attention: bool = False,
     random_seeds: Optional[List[int]] = None,
     batch_size: int = 4,
     max_docs: Optional[int] = None,
@@ -753,6 +761,7 @@ def evaluate_single_dataset(
     estimators: Dict[str, Any] = {
         "self_similarity": SelfSimilarityImportanceEstimator(),
         "centroid_distance": CentroidDistanceImportanceEstimator(),
+        "svd": SVDImportanceEstimator(),
     }
 
     if include_probe:
@@ -772,6 +781,19 @@ def evaluate_single_dataset(
         importance_cache[est_name] = output.scores  # type: ignore
         print(f"    {est_name}: {elapsed:.2f}s")
 
+    if include_attention:
+        print("    Computing attention-based importance (forward passes with output_attentions)...")
+        t0 = time.time()
+        attn_estimator = AttentionImportanceEstimator(
+            model=model, processor=processor, layer_index=-1,
+        )
+        attn_output = attn_estimator.estimate_from_images(
+            images, doc_embeddings=doc_embeddings, batch_size=1,
+        )
+        importance_cache["attention"] = attn_output.scores
+        elapsed = time.time() - t0
+        print(f"    attention: {elapsed:.2f}s")
+
     # Define experiment configurations
     importance_methods = list(importance_cache.keys())
 
@@ -779,6 +801,7 @@ def evaluate_single_dataset(
     ALL_IMPORTANCE_METHODS = [
         "topk", "weighted_hierarchical", "protect_and_pool",
         "adaptive", "split_allocate", "importance_weighted_distance",
+        "importance_weighted_kmeans",
     ]
     # Filter by allowed methods if specified
     active_importance_methods = [
@@ -960,6 +983,7 @@ def run_evaluation(
     pool_factors: List[int],
     output_dir: str,
     include_probe: bool = False,
+    include_attention: bool = False,
     random_seeds: Optional[List[int]] = None,
     batch_size: int = 4,
     max_docs: Optional[int] = None,
@@ -1051,6 +1075,7 @@ def run_evaluation(
                 dataset_name=ds_name,
                 pool_factors=pool_factors,
                 include_probe=include_probe,
+                include_attention=include_attention,
                 random_seeds=random_seeds,
                 batch_size=batch_size,
                 max_docs=max_docs,
@@ -1374,6 +1399,10 @@ Examples:
         help="Include probe-based importance estimation (requires encoding probes through model)",
     )
     parser.add_argument(
+        "--include-attention", action="store_true",
+        help="Include attention-based importance estimation (requires forward pass with output_attentions=True)",
+    )
+    parser.add_argument(
         "--random-seeds", type=int, nargs="*", default=None,
         help="Seeds for random baseline (multiple seeds = mean+/-std). "
              "Use '--random-seeds 42 123 456' for 3 seeds.",
@@ -1407,6 +1436,7 @@ Examples:
         pool_factors=args.pool_factors,
         output_dir=args.output_dir,
         include_probe=args.include_probe,
+        include_attention=args.include_attention,
         random_seeds=args.random_seeds,
         batch_size=args.batch_size,
         max_docs=args.max_docs,

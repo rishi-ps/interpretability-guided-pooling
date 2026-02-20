@@ -7,17 +7,20 @@ document embeddings from ColPali-family models.
 """
 
 from src.importance_estimation import (
+    AttentionImportanceEstimator,
     BaseImportanceEstimator,
     CentroidDistanceImportanceEstimator,
     ImportanceOutput,
     ProbeImportanceEstimator,
     SelfSimilarityImportanceEstimator,
+    SVDImportanceEstimator,
     get_importance_map,
 )
 from src.importance_guided_pooling import (
     AdaptivePoolFactorTokenPooler,
     ImportanceWeightedDistancePooler,
     ImportanceWeightedHierarchicalTokenPooler,
+    ImportanceWeightedKMeansTokenPooler,
     ProtectAndPoolTokenPooler,
     SplitAndAllocateTokenPooler,
     TopKTokenPooler,
@@ -25,16 +28,19 @@ from src.importance_guided_pooling import (
 
 __all__ = [
     # Importance estimation
+    "AttentionImportanceEstimator",
     "BaseImportanceEstimator",
     "CentroidDistanceImportanceEstimator",
     "ImportanceOutput",
     "ProbeImportanceEstimator",
     "SelfSimilarityImportanceEstimator",
+    "SVDImportanceEstimator",
     "get_importance_map",
     # Pooling strategies
     "AdaptivePoolFactorTokenPooler",
     "ImportanceWeightedDistancePooler",
     "ImportanceWeightedHierarchicalTokenPooler",
+    "ImportanceWeightedKMeansTokenPooler",
     "ProtectAndPoolTokenPooler",
     "SplitAndAllocateTokenPooler",
     "TopKTokenPooler",

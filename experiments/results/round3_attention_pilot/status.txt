@@ -1,0 +1,3 @@
+=== COMPLETED (13:12:47) ===
+Total time: 52.5m
+Results: experiments/results/round3_attention_pilot/results_colmodernvbert_all.csv
